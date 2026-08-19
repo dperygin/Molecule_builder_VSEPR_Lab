@@ -568,6 +568,7 @@ body{
         <div class="panel-title">Orbital legend</div>
         <div class="legend-row"><span class="legend-swatch" style="background:#49e0c8;"></span>Bonding electron density</div>
         <div class="legend-row"><span class="legend-swatch" style="background:#969ea6;position:relative;"></span>Lone pairs (dots = electron pair)</div>
+        <div class="legend-row"><span class="legend-swatch" style="background:#eee08a;"></span>Single unpaired electron (one dot, e.g. an unbonded H)</div>
         <div class="legend-row" style="color:var(--text-faint);font-size:10.5px;">Illustrative VSEPR-style rendering — not a computed wavefunction.</div>
       </div>
     </aside>
@@ -858,8 +859,20 @@ function lonePairCount(atom){
   // beyond its neutral valence count; a positive charge means one fewer.
   // Effective electron count = neutral valence electrons minus the charge.
   const effectiveVe = el.ve - (atom.charge||0);
-  const remaining = effectiveVe - bondOrderSum;
-  return Math.max(0, Math.min(3, Math.round(remaining/2)));
+  const remaining = Math.max(0, effectiveVe - bondOrderSum);
+  // Floor, not round — a lone PAIR is two electrons. An odd number left
+  // over (e.g. an unbonded H, which only has 1 valence electron total)
+  // is a single unpaired electron, not something to round up into an
+  // extra phantom pair. See hasUnpairedElectron() for that leftover case.
+  return Math.max(0, Math.min(3, Math.floor(remaining/2)));
+}
+
+function hasUnpairedElectron(atom){
+  const el = ELEMENTS[atom.sym];
+  const bondOrderSum = atomBonds(atom).reduce((sum,b)=> sum + b.order, 0);
+  const effectiveVe = el.ve - (atom.charge||0);
+  const remaining = Math.max(0, effectiveVe - bondOrderSum);
+  return (remaining % 2) === 1;
 }
 
 function buildOrbitalGroup(atom){
@@ -913,37 +926,91 @@ function buildOrbitalGroup(atom){
     });
   }
 
+  // a single unpaired electron (e.g. an unbonded H, which only has 1
+  // valence electron to begin with) gets one dot, not a lone-pair lobe —
+  // there's only one electron here, not a pair of two.
+  function addUnpairedElectronDot(dir){
+    const dotR = r * 0.18;
+    const dist = (r+0.55) * 0.82;
+    const dot = new THREE.Mesh(lobeGeo, dotMat);
+    dot.scale.setScalar(dotR);
+    dot.position.copy(dir).multiplyScalar(dist);
+    group.add(dot);
+  }
+
   // bonding orbitals — soft lobes straddling each bond axis
   bondDirs.forEach(d => addLobe(d, 0x49e0c8, 1.15, 0.62, 0.32));
 
-  // lone pairs — spread around the directions opposite existing bonds
+  // lone pairs (and a leftover unpaired single electron, if there is one)
+  // — placed by fitting the same idealized VSEPR direction template used
+  // elsewhere (idealDirections) to the atom's actual bond directions, then
+  // assigning whichever template slots the real bonds AREN'T using. This
+  // is what correctly distinguishes cases like XeF4 (2 lone pairs land on
+  // the two slots opposite each other, 180° apart — the true square-planar
+  // answer) from water (2 lone pairs land on adjacent tetrahedral slots,
+  // ~109.5° apart, same side) — a single hardcoded "cone spread" can't
+  // represent both correctly, since which slots are left over depends on
+  // the specific geometry.
   const lp = lonePairCount(atom);
-  if (lp > 0){
-    let seed;
+  const unpaired = hasUnpairedElectron(atom);
+  const extraSlotsNeeded = lp + (unpaired ? 1 : 0);
+  if (extraSlotsNeeded > 0){
+    const steric = bondDirs.length + extraSlotsNeeded;
+    const canonical = idealDirections(Math.max(steric,1));
+
+    let quat = new THREE.Quaternion();
     if (bondDirs.length > 0){
-      seed = bondDirs.reduce((acc,d)=>acc.add(d), new THREE.Vector3(0,0,0));
-      if (seed.lengthSq() < 1e-6) seed.set(0,1,0); else seed.negate().normalize();
-    } else {
-      seed = new THREE.Vector3(0,1,0);
-    }
-    // build an orthonormal frame around the seed direction to spread lobes
-    const helper = Math.abs(seed.y) < 0.9 ? new THREE.Vector3(0,1,0) : new THREE.Vector3(1,0,0);
-    const u = new THREE.Vector3().crossVectors(seed, helper).normalize();
-    const v = new THREE.Vector3().crossVectors(seed, u).normalize();
-    const spreadAngle = 0.5; // radians, cone half-angle for multiple lone pairs
-    for (let i=0;i<lp;i++){
-      let dir;
-      if (lp === 1){ dir = seed.clone(); }
-      else {
-        const ang = (i/(lp-1) - 0.5) * spreadAngle * 2;
-        dir = seed.clone().applyAxisAngle(u, ang);
+      quat.setFromUnitVectors(new THREE.Vector3(0,0,1), bondDirs[0]);
+      if (bondDirs.length > 1){
+        // a single anchor leaves rotation around that axis undetermined;
+        // use a second bond direction to pin down the twist too, so the
+        // whole template lines up with the atom's real geometry, not just
+        // one bond of it.
+        const rotated = canonical.map(v=>v.clone().applyQuaternion(quat));
+        let best=-1, bestDot=-Infinity;
+        rotated.forEach((c,idx)=>{
+          if (idx===0) return;
+          const dot = c.dot(bondDirs[1]);
+          if (dot>bestDot){ bestDot=dot; best=idx; }
+        });
+        if (best>=0){
+          const axis = bondDirs[0].clone().normalize();
+          const projectPerp = v => v.clone().sub(axis.clone().multiplyScalar(v.dot(axis)));
+          const a = projectPerp(rotated[best]), b = projectPerp(bondDirs[1]);
+          if (a.lengthSq()>1e-6 && b.lengthSq()>1e-6){
+            a.normalize(); b.normalize();
+            let twist = Math.acos(Math.max(-1,Math.min(1,a.dot(b))));
+            const cross = new THREE.Vector3().crossVectors(a,b);
+            if (cross.dot(axis) < 0) twist = -twist;
+            quat = new THREE.Quaternion().setFromAxisAngle(axis, twist).multiply(quat);
+          }
+        }
       }
-      addLonePairLobe(dir.normalize());
+    }
+
+    const worldSlots = canonical.map(v => v.clone().applyQuaternion(quat));
+    const usedSlots = new Set();
+    bondDirs.forEach(d=>{
+      let best=-1, bestDot=-Infinity;
+      worldSlots.forEach((c,idx)=>{
+        if (usedSlots.has(idx)) return;
+        const dot = c.dot(d);
+        if (dot>bestDot){ bestDot=dot; best=idx; }
+      });
+      if (best>=0) usedSlots.add(best);
+    });
+
+    const freeSlots = worldSlots.map((v,idx)=>idx).filter(idx=>!usedSlots.has(idx));
+    freeSlots.slice(0, lp).forEach(idx => addLonePairLobe(worldSlots[idx].clone().normalize()));
+    if (unpaired && freeSlots.length > lp){
+      addUnpairedElectronDot(worldSlots[freeSlots[lp]].clone().normalize());
     }
   }
 
-  // isolated atom, no bonds and no lone pairs computed (e.g. single noble-like placement)
-  if (bondDirs.length === 0 && lp === 0){
+  // isolated atom with genuinely nothing known about it (0 bonds, 0 lone
+  // pairs, no unpaired electron either — shouldn't normally happen given
+  // any real element, but kept as a harmless fallback)
+  if (bondDirs.length === 0 && lp === 0 && !unpaired){
     const mat = new THREE.MeshBasicMaterial({ color:0x49e0c8, transparent:true, opacity:0.12, blending:THREE.AdditiveBlending, depthWrite:false });
     const mesh = new THREE.Mesh(lobeGeo, mat);
     mesh.scale.setScalar(r*1.9);
